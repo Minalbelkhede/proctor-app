@@ -1,0 +1,359 @@
+import os
+import time
+import threading
+import cv2
+import keyboard
+import pyaudio
+import numpy as np
+import tkinter as tk
+from tkinter import messagebox
+import webbrowser
+import pyautogui
+import queue
+from PIL import Image, ImageTk
+import stat
+import ctypes
+
+class ProctoringSystem:
+    def __init__(self):
+        self.exam_url = ""
+        self.warnings = 0
+        self.warning_limit = 3
+        self.is_exam_running = False
+        self.log_entries = []
+        self.screen_recording = False
+        self.screen_thread = None
+        self.warning_counts = {"face": 0}
+        self.WARNING_THRESHOLD = 3
+        self.stop_monitoring = False
+        self.log_file_path = None  
+        self.video_source = 0
+        self.face_detected = False
+        self.cv_image = None
+        self.photo = None
+        self.log_queue = queue.Queue()
+        self.log_window = None
+
+    def log(self, message):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        log_message = f"[{timestamp}] {message}\n"
+        self.log_entries.append(log_message)
+        self.log_queue.put(log_message)
+
+    def process_logs(self):
+        try:
+            while not self.log_queue.empty():
+                message = self.log_queue.get_nowait()
+                self.update_log_display(message)
+        except queue.Empty:
+            pass
+        finally:
+            self.log_window.after(100, self.process_logs)
+
+    def update_log_display(self, message):
+        self.text_area.config(state=tk.NORMAL)
+        self.text_area.insert(tk.END, message)
+        self.text_area.see(tk.END)
+        self.text_area.config(state=tk.DISABLED)
+
+    def warn_user(self, reason):
+        self.warnings += 1
+        self.log(f"Warning: {reason}")
+        if self.warnings >= self.warning_limit:
+            self.end_exam("Warning limit exceeded!")
+
+    def end_exam(self, reason):
+        self.is_exam_running = False
+        self.log(f"Exam ended: {reason}")
+        self.stop_screen_recording()
+        self.stop_monitoring = True
+        self.save_logs()
+
+    def save_logs(self):
+        """Save the logs to a timestamped HTML file."""
+        timestamp = time.strftime("%Y%m%d_%H%M%S")  # Create a timestamp
+        self.log_file_path = f"exam_logs_{timestamp}.html"  # Generate log file name
+
+        # Begin the HTML file with basic structure
+        try:
+            with open(self.log_file_path, 'w') as log_file:
+                log_file.write("<html>\n<head>\n<title>Exam Logs</title>\n</head>\n<body>\n")
+                log_file.write("<h1>Exam Logs</h1>\n")
+                log_file.write("<ul>\n")  # Start an unordered list to hold log entries
+
+                # Write each log entry as a list item
+                for entry in self.log_entries:
+                    log_file.write(f"<li>{entry}</li>\n")
+
+                log_file.write("</ul>\n")  # End the unordered list
+                log_file.write("</body>\n</html>\n")  # Close HTML tags
+
+            # Set the file to read-only mode
+            if os.name == 'nt':  # Windows
+                ctypes.windll.kernel32.SetFileAttributesW(self.log_file_path, 0x00000001)  # FILE_ATTRIBUTE_READONLY
+            else:  # Unix-like
+                os.chmod(self.log_file_path, stat.S_IREAD)
+
+            self.log(f"Logs saved to {self.log_file_path}")
+            
+        except Exception as e:
+            self.log(f"Error saving logs: {e}")
+
+    def start_exam(self):
+        if not self.exam_url:
+            self.show_message("Please enter a valid exam URL to start.")
+            return
+            
+        self.is_exam_running = True
+        self.log("Exam started.")
+        self.open_log_window()
+        self.start_screen_recording()
+
+        threading.Thread(target=self.monitor_webcam).start()
+        threading.Thread(target=self.monitor_sound).start()
+        threading.Thread(target=self.monitor_keyboard).start()
+
+        keyboard.add_hotkey('esc', lambda: self.end_exam("Exam submitted by user!"))
+
+    def open_log_window(self):
+        """Open the log window after the exam starts."""
+        self.log_window = tk.Tk()
+        self.log_window.title("Log Messages")
+        self.log_window.geometry("600x400")
+        self.text_area = tk.Text(self.log_window)
+        self.text_area.pack(expand=True, fill='both')
+        self.text_area.config(state=tk.DISABLED)
+
+        # Start processing the log queue
+        self.process_logs()
+
+    def start_screen_recording(self):
+        """Start screen recording with OpenCV and notify user."""
+        self.screen_recording = True
+        self.screen_thread = threading.Thread(target=self.record_screen)
+        self.screen_thread.start()
+        self.log("Screen Recording Started")
+
+    def record_screen(self):
+        """Capture screen and save it to a file."""
+        screen_size = pyautogui.size()
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        
+        # Create a timestamped filename for the recording
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        recording_file_name = f"screen_record_{timestamp}.avi"  
+        out = cv2.VideoWriter(recording_file_name, fourcc, 20.0, screen_size)
+        
+        while self.screen_recording:
+            img = pyautogui.screenshot()
+            frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            out.write(frame)
+            time.sleep(0.1)  # Adjust for desired frame rate
+            
+        out.release()
+        self.log("Screen Recording Stopped")
+
+        # Make the recording file non-deletable
+        self.make_file_non_deletable(recording_file_name)
+
+    def make_file_non_deletable(self, file_path):
+        """Make the file non-deletable by changing its attributes."""
+        if os.name == 'nt':  # Windows
+            ctypes.windll.kernel32.SetFileAttributesW(file_path, 0x00000001)  # FILE_ATTRIBUTE_READONLY
+        else:  # Unix-like
+            os.chmod(file_path, stat.S_IREAD)  # Read-only permission for owner only
+        
+    def stop_screen_recording(self):
+        """Stop screen recording."""
+        self.screen_recording = False
+        if self.screen_thread:
+            self.screen_thread.join()
+
+    def show_message(self, title, message):
+        """Display a message to the user."""
+        messagebox.showinfo(title, message)
+
+    def monitor_webcam(self):
+        """Monitor webcam for face detection."""
+        cap = cv2.VideoCapture(0)
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        time.sleep(2)  # Allow some time for the camera to initialize
+        
+        screen_width = pyautogui.size().width
+        screen_height = pyautogui.size().height
+
+        while not self.stop_monitoring:
+            ret, frame = cap.read()
+            if not ret:
+                self.show_message("Failed to capture webcam feed.")
+                break
+
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5)
+
+            if len(faces) == 0:
+                self.warning_counts["face"] += 1
+                self.warn_user("No face detected.")
+                if self.warning_counts["face"] >= self.WARNING_THRESHOLD:
+                    self.end_exam("Test has been terminated due to no face detection.")
+            else:
+                self.warning_counts["face"] = 0  # Reset warning count if face is detected
+
+            cv2.imshow("Proctoring - Webcam Monitoring", frame)
+            
+            # Define window size and position for the webcam feed
+            window_width = 640  # Adjust width as needed
+            window_height = 480  # Adjust height as needed
+            x_position = screen_width - window_width - 10  # 10 pixels from the right edge
+            y_position = screen_height - window_height - 10  # 10 pixels from the bottom edge
+
+            cv2.moveWindow("Proctoring - Webcam Monitoring", x_position, y_position)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.show_message("Proctoring session ended by user.")
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+    def monitor_sound(self):
+        """Monitor the microphone for sound detection."""
+        CHUNK = 1024  # Number of audio samples per frame
+        RATE = 44100  # Sample rate in Hz
+        THRESHOLD = 0.07  # Threshold for sound detection
+
+        audio = pyaudio.PyAudio()
+        stream = audio.open(format=pyaudio.paFloat32,
+                            channels=1,
+                            rate=RATE,
+                            input=True,
+                            frames_per_buffer=CHUNK)
+
+        while self.is_exam_running:
+            data = stream.read(CHUNK)
+            audio_data = np.frombuffer(data, dtype=np.float32)
+            volume_norm = np.linalg.norm(audio_data)
+            if volume_norm > THRESHOLD:
+                self.warn_user("Sound detected!")
+
+            time.sleep(1)
+
+        stream.stop_stream()
+        stream.close()
+        audio.terminate()
+
+    def monitor_keyboard(self):
+        """Monitor the keyboard for unauthorized access."""
+        prohibited_keys = ['shift', 'tab', 'alt', 'ctrl', 'enter']  # Example shortcuts
+        while self.is_exam_running:
+            if any(keyboard.is_pressed(key) for key in prohibited_keys):
+                self.warn_user("Unauthorized keyboard access detected.")
+            time.sleep(1)
+            
+    def show_instructions(self):
+        """Show instructions and get the exam URL before starting the exam."""
+        self.instruction_window = tk.Tk()
+        self.instruction_window.title("Exam Instructions")
+        self.instruction_window.attributes('-fullscreen', True)
+        self.instruction_window.configure(bg='skyblue')
+
+        # Instructions text
+        instructions_text = """\
+        Welcome to the Exam
+        Please read the following instructions carefully:
+
+        1. Before beginning the test, make sure you close all tabs and programs. 
+        2. Ensure that you have a quiet place to take the test and strong internet access.
+        3. There are multiple-choice questions on the test.
+        4. During the exam, electronic gadgets are not permitted.
+        5. Changing tabs while taking the test is prohibited.
+        6. Throughout the exam, ensure your camera is turned on as you are being watched.
+        7. If any illegal apps are accessed, shortcut keys are hit, a sound is detected, or a face is not identified, the test will finish.
+        8. To submit the exam, press the 'esc' key.
+        9. To begin the exam, make sure you enter the right exam URL.
+
+        Good luck!
+        """
+        instructions_label = tk.Label(self.instruction_window, text=instructions_text, justify="left", font=("Helvetica", 14), bg='white', fg='black')
+        instructions_label.pack(pady=50)
+
+        # Input for exam URL
+        url_label = tk.Label(self.instruction_window, text="Please enter the exam URL:", font=("Helvetica", 16), bg='white', fg='black')
+        url_label.pack(pady=20)
+    
+        self.url_entry = tk.Entry(self.instruction_window, font=("Helvetica", 12), width=100, fg='black')
+        self.url_entry.pack(pady=10)
+
+        # Initially disable start button
+        self.start_button = tk.Button(self.instruction_window, text="Start Exam", command=lambda: self.start_exam_from_input(), font=("Helvetica", 12), bg='blue', fg='white', state=tk.DISABLED)
+        self.start_button.pack(pady=20)
+        
+        # Close button to close the instruction window
+        close_button = tk.Button(self.instruction_window, text="Close", command=self.close_instruction_window, font=("Helvetica", 12), bg='red', fg='white')
+        close_button.pack(pady=10)
+
+        # Create label for webcam feed
+        self.video_label = tk.Label(self.instruction_window)  # Label to show video feed
+        self.video_label.pack(side=tk.BOTTOM, anchor=tk.NE, padx=10, pady=10)  # Position it at the bottom-right corner
+
+        # Start a thread to check for face detection
+        threading.Thread(target=self.check_face_detection).start()
+
+        self.instruction_window.mainloop()
+
+    def close_instruction_window(self):
+        """Close the instruction window."""
+        self.instruction_window.destroy()
+
+    def check_face_detection(self):
+        """Check for face detection at the start of the exam."""
+        cap = cv2.VideoCapture(self.video_source)
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    
+        # Allow time for the camera to initialize
+        time.sleep(2)
+
+        while not self.face_detected:
+            ret, frame = cap.read()
+            if not ret:
+                self.show_message("Failed to capture webcam feed.")
+                break
+
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5)
+
+            # Optionally resize the frame before displaying
+            frame = cv2.resize(frame, (400, 400))  # Specify desired width and height
+            self.cv_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert from BGR to RGB
+            img = Image.fromarray(self.cv_image)  # Create a PIL image from the array
+            self.photo = ImageTk.PhotoImage(img)  # Create a PhotoImage from the PIL image
+
+            if len(faces) > 0:
+                self.face_detected = True
+                self.show_message("Checking camera access.", "Face detected...,\nPlease enter the exam URL and click Start Exam.")
+                self.start_button.config(state=tk.NORMAL)  # Enable the start button
+            else:
+                self.start_button.config(state=tk.DISABLED)  # Disable the start button if no face detected
+                self.show_message("Checking camera access.", "Face not detected...,\nPlease turn on the camera.")
+                
+            self.video_label.config(image=self.photo)  # Update label with new image
+            self.video_label.image = self.photo  # Keep a reference to avoid garbage collection
+
+            time.sleep(0.1)  # Adjust as necessary for smoother updates
+ 
+        cap.release()
+
+    def start_exam_from_input(self):
+        """Start the exam using the provided URL."""
+        self.exam_url = self.url_entry.get()
+        if self.exam_url:
+            webbrowser.open(self.exam_url)  # Open the exam URL in the browser
+            self.start_exam()  # Start the proctoring system
+            self.instruction_window.destroy()  # Close the instruction window
+        else:
+            self.show_message("No exam URL provided. Exiting.")
+
+if __name__ == "__main__":
+    proctoring_system = ProctoringSystem()  # Initialize the proctoring system
+    proctoring_system.show_instructions()  # Show instructions and get the exam URL
+
